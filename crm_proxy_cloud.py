@@ -15,21 +15,21 @@ import json
 import os
 import time
 import threading
+import socket
+import socketserver
 from datetime import datetime, timedelta, timezone
 
 # ══════════════════════════════════════════════
-#  НАЛАШТУВАННЯ  (ті самі, що в crm_proxy.py)
+#  НАЛАШТУВАННЯ
 # ══════════════════════════════════════════════
 API_KEY  = "1PtL9c3Qc1S8iiRDgazx2Yv1"
 CRM_BASE = "https://api.keepincrm.com/v1"
-DELAY_MS = 200   # Зменшено з 650 мс → повний синк ~4000 лідів займе ~30-40 сек замість 150+
+DELAY_MS = 200
 INC_DAYS = 14
-PORT     = int(os.environ.get('PORT', 8765))   # Render задає PORT сам
+PORT     = int(os.environ.get('PORT', 8765))
 # ══════════════════════════════════════════════
 
-# На Render файлова система тимчасова — використовуємо /tmp
 DATA_FILE = '/tmp/crm_data.json'
-
 CATMAP = {'А': 'A', 'В': 'B', 'С': 'C', 'A': 'A', 'B': 'B', 'C': 'C'}
 
 
@@ -100,10 +100,6 @@ def fetch_page(endpoint, page):
 
 
 def sync_crm(mode, send_event):
-    date_filter = ''
-    # Render free tier wipes /tmp on every restart — always fetch full 2026 data
-    # INC_DAYS incremental window intentionally not used for cloud
-
     active_rows, lost_rows, won_rows = [], [], []
     FB_SOURCE_ID = 6
     CUT_DATE = '2026-01-01'
@@ -175,17 +171,12 @@ def sync_crm(mode, send_event):
             if page <= total_pages: time.sleep(DELAY_MS / 1000)
         return True
 
-    df = date_filter
-    # Використовуємо created_at_gteq (не ordered_at_gteq):
-    # ordered_at — дата замовлення, порожня у більшості лідів → фільтр відсікає їх.
-    # created_at — дата створення ліда, завжди заповнена → повертає всі ліди з початку року.
-    seg1 = f"/agreements?q%5Bcreated_at_gteq%5D={CUT_DATE}&q%5Bresult_blank%5D=1{df}"
+    seg1 = f"/agreements?q%5Bcreated_at_gteq%5D={CUT_DATE}&q%5Bresult_blank%5D=1"
     if not fetch_segment("Активні 2026+", seg1, 0, 50, 'active'): return
 
-    seg3 = f"/agreements?q%5Bresult_eq%5D=failed&q%5Bcreated_at_gteq%5D={CUT_DATE}{df}"
+    seg3 = f"/agreements?q%5Bresult_eq%5D=failed&q%5Bcreated_at_gteq%5D={CUT_DATE}"
     if not fetch_segment("Програні 2026+", seg3, 50, 49, 'lost'): return
 
-    # Incremental merge (in-memory on cloud)
     if mode == 'inc' and os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, encoding='utf-8') as f:
@@ -224,7 +215,6 @@ def sync_crm(mode, send_event):
     except Exception as e:
         print(f"Save failed: {e}")
 
-    # Стрімимо дані через SSE-чанки → клієнт не робить окремий /api/data запит
     _CH = 300
     def _chunks(lst):
         for i in range(0, max(1, len(lst)), _CH):
@@ -245,7 +235,7 @@ def sync_crm(mode, send_event):
 class Handler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
-        pass  # Silent on cloud
+        pass
 
     def do_OPTIONS(self):
         self.send_response(200)
@@ -259,7 +249,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._serve_data(); return
         if self.path == '/api/ping':
             self._json({'ok': True, 'server': 'cloud'}); return
-        # Root — health check для Render
         if self.path in ('/', '/health'):
             self._json({'ok': True, 'service': 'ads-dashboard-crm-proxy'}); return
         self.send_response(404); self.end_headers()
@@ -299,6 +288,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._cors()
         self.end_headers()
 
+        _done = threading.Event()
+
         def send_event(obj):
             try:
                 line = 'data: ' + json.dumps(obj, ensure_ascii=False) + '\n\n'
@@ -307,16 +298,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except BrokenPipeError:
                 pass
 
+        def _keepalive():
+            while not _done.wait(15):
+                try:
+                    self.wfile.write(b': keepalive\n\n')
+                    self.wfile.flush()
+                except Exception:
+                    break
+
+        threading.Thread(target=_keepalive, daemon=True).start()
+
         try:
             sync_crm(mode, send_event)
         except Exception as e:
             send_event({'type': 'error', 'message': str(e)})
+        finally:
+            _done.set()
+
+
+class _ThreadedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
 
 
 def main():
     print(f'CRM Proxy Cloud running on port {PORT}')
-    # Bind to 0.0.0.0 — обов'язково для Render
-    server = http.server.HTTPServer(('0.0.0.0', PORT), Handler)
+    server = _ThreadedServer(('0.0.0.0', PORT), Handler)
+    server.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
