@@ -101,9 +101,8 @@ def fetch_page(endpoint, page):
 
 def sync_crm(mode, send_event):
     date_filter = ''
-    if mode == 'inc':
-        since = datetime.now(tz=timezone.utc) - timedelta(days=INC_DAYS)
-        date_filter = f"&q%5Bordered_at_gteq%5D={since.strftime('%Y-%m-%d')}"
+    # Render free tier wipes /tmp on every restart — always fetch full 2026 data
+    # INC_DAYS incremental window intentionally not used for cloud
 
     active_rows, lost_rows, won_rows = [], [], []
     FB_SOURCE_ID = 6
