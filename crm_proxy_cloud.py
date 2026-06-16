@@ -224,6 +224,15 @@ def sync_crm(mode, send_event):
     except Exception as e:
         print(f"Save failed: {e}")
 
+    # Стрімимо дані через SSE-чанки → клієнт не робить окремий /api/data запит
+    _CH = 300
+    def _chunks(lst):
+        for i in range(0, max(1, len(lst)), _CH):
+            yield lst[i:i+_CH]
+    for c in _chunks(active_rows): send_event({'type': 'data_active', 'rows': c})
+    for c in _chunks(lost_rows):   send_event({'type': 'data_lost',   'rows': c})
+    for c in _chunks(won_rows):    send_event({'type': 'data_won',    'rows': c})
+
     send_event({
         'type': 'done_signal',
         'total': payload['total'],
