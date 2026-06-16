@@ -22,7 +22,7 @@ from datetime import datetime, timedelta, timezone
 # ══════════════════════════════════════════════
 API_KEY  = "1PtL9c3Qc1S8iiRDgazx2Yv1"
 CRM_BASE = "https://api.keepincrm.com/v1"
-DELAY_MS = 650
+DELAY_MS = 200   # Зменшено з 650 мс → повний синк ~4000 лідів займе ~30-40 сек замість 150+
 INC_DAYS = 14
 PORT     = int(os.environ.get('PORT', 8765))   # Render задає PORT сам
 # ══════════════════════════════════════════════
@@ -176,10 +176,13 @@ def sync_crm(mode, send_event):
         return True
 
     df = date_filter
-    seg1 = f"/agreements?q%5Bordered_at_gteq%5D={CUT_DATE}&q%5Bresult_blank%5D=1{df}"
+    # Використовуємо created_at_gteq (не ordered_at_gteq):
+    # ordered_at — дата замовлення, порожня у більшості лідів → фільтр відсікає їх.
+    # created_at — дата створення ліда, завжди заповнена → повертає всі ліди з початку року.
+    seg1 = f"/agreements?q%5Bcreated_at_gteq%5D={CUT_DATE}&q%5Bresult_blank%5D=1{df}"
     if not fetch_segment("Активні 2026+", seg1, 0, 50, 'active'): return
 
-    seg3 = f"/agreements?q%5Bresult_eq%5D=failed&q%5Bordered_at_gteq%5D={CUT_DATE}{df}"
+    seg3 = f"/agreements?q%5Bresult_eq%5D=failed&q%5Bcreated_at_gteq%5D={CUT_DATE}{df}"
     if not fetch_segment("Програні 2026+", seg3, 50, 49, 'lost'): return
 
     # Incremental merge (in-memory on cloud)
