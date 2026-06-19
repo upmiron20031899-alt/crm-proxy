@@ -20,16 +20,18 @@ import socketserver
 from datetime import datetime, timedelta, timezone
 
 # ══════════════════════════════════════════════
-#  НАЛАШТУВАННЯ
+#  НАЛАШТУВАННЯ  (ті самі, що в crm_proxy.py)
 # ══════════════════════════════════════════════
 API_KEY  = "1PtL9c3Qc1S8iiRDgazx2Yv1"
 CRM_BASE = "https://api.keepincrm.com/v1"
-DELAY_MS = 200
-INC_DAYS = 14
-PORT     = int(os.environ.get('PORT', 8765))
+DELAY_MS = 200   # Зменшено з 650 мс → повний синк ~4000 лідів займе ~30-40 сек замість 150+
+INC_DAYS = 5
+PORT     = int(os.environ.get('PORT', 8765))   # Render задає PORT сам
 # ══════════════════════════════════════════════
 
+# На Render файлова система тимчасова — використовуємо /tmp
 DATA_FILE = '/tmp/crm_data.json'
+
 CATMAP = {'А': 'A', 'В': 'B', 'С': 'C', 'A': 'A', 'B': 'B', 'C': 'C'}
 
 
@@ -100,9 +102,17 @@ def fetch_page(endpoint, page):
 
 
 def sync_crm(mode, send_event):
+    date_filter = ''
     active_rows, lost_rows, won_rows = [], [], []
     FB_SOURCE_ID = 6
-    CUT_DATE = '2026-01-01'
+
+    # Inc mode: fetch only last INC_DAYS days (client localStorage holds full history)
+    # Full mode: fetch all 2026 data
+    if mode == 'inc':
+        since = datetime.now(tz=timezone.utc) - timedelta(days=INC_DAYS)
+        CUT_DATE = since.strftime('%Y-%m-%d')
+    else:
+        CUT_DATE = '2026-01-01'
 
     def process_item(item, status):
         funnel_id    = (item.get('funnel') or {}).get('id')
@@ -140,10 +150,12 @@ def sync_crm(mode, send_event):
             if row.get('date'): out.append((row, status))
         return out
 
-    def fetch_segment(label, endpoint, phase_start, phase_len, status):
+    def fetch_segment(label, endpoint, phase_start, phase_len, status, max_pages=None):
         page = 1
         total_pages = 1
         while page <= total_pages:
+            if max_pages is not None and page > max_pages:
+                break
             try:
                 data = fetch_page(endpoint, page)
             except urllib.error.HTTPError as e:
@@ -154,6 +166,7 @@ def sync_crm(mode, send_event):
             items = data.get('items') or []
             pg    = data.get('pagination') or {}
             total_pages = int(pg.get('total_pages') or 1)
+            display_total = min(total_pages, max_pages) if max_pages else total_pages
 
             for item in items:
                 for row, kind in process_item(item, status):
@@ -161,22 +174,31 @@ def sync_crm(mode, send_event):
                     elif kind == 'active': active_rows.append(row)
                     elif kind == 'lost':   lost_rows.append(row)
 
-            pct = phase_start + (page / total_pages) * phase_len
+            pct = phase_start + (page / display_total) * phase_len
             send_event({
                 'type': 'progress',
-                'label': f"{label}: {page}/{total_pages}  ·  лідів:{len(active_rows)+len(lost_rows)}  програних:{len(lost_rows)}  оплат:{len(won_rows)}",
+                'label': f"{label}: {page}/{display_total}  ·  лідів:{len(active_rows)+len(lost_rows)}  програних:{len(lost_rows)}  оплат:{len(won_rows)}",
                 'pct': round(min(pct, 99), 1),
             })
             page += 1
             if page <= total_pages: time.sleep(DELAY_MS / 1000)
         return True
 
-    seg1 = f"/agreements?q%5Bcreated_at_gteq%5D={CUT_DATE}&q%5Bresult_blank%5D=1"
-    if not fetch_segment("Активні 2026+", seg1, 0, 50, 'active'): return
+    df = date_filter
+    if mode == 'inc':
+        # updated_at_gteq — ловимо ВСІ зміни за останні INC_DAYS днів:
+        # нові ліди, зміни статусів, оплати по лютневих заявках тощо.
+        seg1 = f"/agreements?q%5Bupdated_at_gteq%5D={CUT_DATE}&q%5Bresult_blank%5D=1{df}"
+        if not fetch_segment("Активні (оновлені)", seg1, 0, 50, 'active'): return
+        seg3 = f"/agreements?q%5Bresult_eq%5D=failed&q%5Bupdated_at_gteq%5D={CUT_DATE}{df}"
+        if not fetch_segment("Програні (оновлені)", seg3, 50, 49, 'lost', max_pages=20): return
+    else:
+        seg1 = f"/agreements?q%5Bcreated_at_gteq%5D=2026-01-01&q%5Bresult_blank%5D=1{df}"
+        if not fetch_segment("Активні 2026+", seg1, 0, 50, 'active'): return
+        seg3 = f"/agreements?q%5Bresult_eq%5D=failed&q%5Bcreated_at_gteq%5D=2026-01-01{df}"
+        if not fetch_segment("Програні 2026+", seg3, 50, 49, 'lost'): return
 
-    seg3 = f"/agreements?q%5Bresult_eq%5D=failed&q%5Bcreated_at_gteq%5D={CUT_DATE}"
-    if not fetch_segment("Програні 2026+", seg3, 50, 49, 'lost'): return
-
+    # Incremental merge (in-memory on cloud)
     if mode == 'inc' and os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, encoding='utf-8') as f:
@@ -215,6 +237,7 @@ def sync_crm(mode, send_event):
     except Exception as e:
         print(f"Save failed: {e}")
 
+    # Стрімимо дані через SSE-чанки → клієнт не робить окремий /api/data запит
     _CH = 300
     def _chunks(lst):
         for i in range(0, max(1, len(lst)), _CH):
@@ -235,7 +258,7 @@ def sync_crm(mode, send_event):
 class Handler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
-        pass
+        pass  # Silent on cloud
 
     def do_OPTIONS(self):
         self.send_response(200)
@@ -249,6 +272,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._serve_data(); return
         if self.path == '/api/ping':
             self._json({'ok': True, 'server': 'cloud'}); return
+        # Root — health check для Render
         if self.path in ('/', '/health'):
             self._json({'ok': True, 'service': 'ads-dashboard-crm-proxy'}); return
         self.send_response(404); self.end_headers()
@@ -299,6 +323,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 pass
 
         def _keepalive():
+            # Кожні 15 сек — Render/Netlify proxy не обриває SSE з'єднання
             while not _done.wait(15):
                 try:
                     self.wfile.write(b': keepalive\n\n')
