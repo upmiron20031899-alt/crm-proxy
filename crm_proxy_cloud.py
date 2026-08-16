@@ -60,16 +60,20 @@ def crm_item_to_row(item, status, is_realizatsiya=False):
     stage = item.get('stage') or {}
     responsible = item.get('main_responsible') or {}
 
+    lead_date = iso_to_dmy(item.get('ordered_at') or item.get('created_at') or '')
+    sale_date = parse_crm_date(str(cf.get('Дата продажу') or '').strip())
     if is_realizatsiya:
-        date_val = (parse_crm_date(str(cf.get('Дата продажу') or '').strip())
-                    or iso_to_dmy(item.get('ordered_at') or item.get('created_at') or ''))
+        # Продаж відносимо до дати ЗАЯВКИ (коли лід прийшов), а не до дати оплати.
+        # Оплата могла прийти через місяць — але в аналітику вона йде за датою заявки.
+        date_val = lead_date or sale_date
     else:
-        date_val = iso_to_dmy(item.get('ordered_at') or item.get('created_at') or '')
+        date_val = lead_date
 
     return {
         'id':            item.get('id'),
         'manager':       str(responsible.get('name') or '').strip(),
         'date':          date_val,
+        'sale_date':     sale_date if is_realizatsiya else '',
         'creo':          str(cf.get('Крео')     or '').strip() or 'Не вказано',
         'adset':         str(cf.get('Адсет')    or '').strip() or 'Не вказано',
         'campaign':      str(cf.get('Кампанія') or '').strip() or 'Не вказано',
@@ -77,6 +81,7 @@ def crm_item_to_row(item, status, is_realizatsiya=False):
         'category':      CATMAP.get(cat_raw),
         'status':        status,
         'stage':         str(stage.get('name')          or '').strip(),
+        'last_note':     str(item.get('last_note')       or '').strip(),
         'reason':        str(archive_status.get('name') or '').strip(),
         'form_purpose':  str(cf.get('Мета встановлення')   or '').strip(),
         'form_budget':   str(cf.get('Бюджет')               or '').strip(),
@@ -192,6 +197,10 @@ def sync_crm(mode, send_event):
         if not fetch_segment("Активні (оновлені)", seg1, 0, 50, 'active'): return
         seg3 = f"/agreements?q%5Bresult_eq%5D=failed&q%5Bupdated_at_gteq%5D={CUT_DATE}{df}"
         if not fetch_segment("Програні (оновлені)", seg3, 50, 49, 'lost', max_pages=20): return
+    elif mode == 'comments':
+        # Тільки активні угоди (усі 2026) — оновлюємо коментарі, без програних/оплат
+        seg1 = f"/agreements?q%5Bcreated_at_gteq%5D=2026-01-01&q%5Bresult_blank%5D=1{df}"
+        if not fetch_segment("Коментарі", seg1, 0, 99, 'active'): return
     else:
         seg1 = f"/agreements?q%5Bcreated_at_gteq%5D=2026-01-01&q%5Bresult_blank%5D=1{df}"
         if not fetch_segment("Активні 2026+", seg1, 0, 50, 'active'): return
@@ -231,11 +240,13 @@ def sync_crm(mode, send_event):
         'total':     len(active_rows) + len(lost_rows) + len(won_rows),
         'synced_at': datetime.now(tz=timezone.utc).isoformat(),
     }
-    try:
-        with open(DATA_FILE, 'w', encoding='utf-8') as f:
-            json.dump(payload, f, ensure_ascii=False)
-    except Exception as e:
-        print(f"Save failed: {e}")
+    # comments-режим не чіпає кеш /tmp (там повний знімок для boot-restore)
+    if mode != 'comments':
+        try:
+            with open(DATA_FILE, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, ensure_ascii=False)
+        except Exception as e:
+            print(f"Save failed: {e}")
 
     # Стрімимо дані через SSE-чанки → клієнт не робить окремий /api/data запит
     _CH = 300
@@ -304,7 +315,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def _serve_sync(self):
-        mode = 'full' if 'mode=full' in self.path else 'inc'
+        if   'mode=full'     in self.path: mode = 'full'
+        elif 'mode=comments' in self.path: mode = 'comments'
+        else:                              mode = 'inc'
         self.send_response(200)
         self.send_header('Content-Type',      'text/event-stream; charset=utf-8')
         self.send_header('Cache-Control',     'no-cache')
