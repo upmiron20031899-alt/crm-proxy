@@ -24,7 +24,8 @@ from datetime import datetime, timedelta, timezone
 # ══════════════════════════════════════════════
 API_KEY  = "1PtL9c3Qc1S8iiRDgazx2Yv1"
 CRM_BASE = "https://api.keepincrm.com/v1"
-DELAY_MS = 200   # Зменшено з 650 мс → повний синк ~4000 лідів займе ~30-40 сек замість 150+
+DELAY_MS = 650   # Ліміт CRM ~100 запитів/хв = 600 мс/запит. 650 мс тримає нас під лімітом
+                 # (200 мс давало ~300/хв → 429 Too Many Requests, ще й разом із роботами дублів/коментарів).
 INC_DAYS = 5
 PORT     = int(os.environ.get('PORT', 8765))   # Render задає PORT сам
 # ══════════════════════════════════════════════
@@ -97,13 +98,29 @@ def fetch_page(endpoint, page):
         'Accept':       'application/json',
         'User-Agent':   'AdsDashboard/2.0',
     })
-    for attempt in range(3):
+    # До 6 спроб. На 429 (перевищено ліміт CRM) — чекаємо (Retry-After або наростаючу паузу)
+    # і пробуємо ще, а не валимо весь синк. На інші помилки — коротка пауза.
+    backoff = 5
+    last_err = None
+    for attempt in range(6):
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 return json.loads(resp.read().decode('utf-8'))
-        except Exception as e:
-            if attempt == 2: raise
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if e.code == 429:
+                ra = e.headers.get('Retry-After') if e.headers else None
+                wait = int(ra) if (ra and str(ra).isdigit()) else backoff
+                time.sleep(min(wait, 60))
+                backoff = min(backoff * 2, 60)
+                continue
+            if attempt == 5: raise
             time.sleep(2)
+        except Exception as e:
+            last_err = e
+            if attempt == 5: raise
+            time.sleep(2)
+    if last_err: raise last_err
 
 
 def sync_crm(mode, send_event):
