@@ -54,6 +54,14 @@ def parse_crm_date(s):
     return iso_to_dmy(s)
 
 
+def lead_status(item):
+    # CRM має чотири значення result: null / failed / archived / successful.
+    # Тягнули лише перші два — і 67 угод, закритих кнопкою «Архівувати»
+    # (result='archived', усі з 07.09.2026), зникали з дашборда цілком:
+    # ні в лідах, ні в програних, а в localStorage висіли «в роботі».
+    return 'active' if item.get('result') is None else 'lost'
+
+
 def crm_item_to_row(item, status, is_realizatsiya=False):
     cf = item.get('custom_fields') or {}
     cat_raw = str(cf.get('Категорія клієнта') or '').strip()
@@ -70,9 +78,13 @@ def crm_item_to_row(item, status, is_realizatsiya=False):
     else:
         date_val = lead_date
 
+    # Угода — за тим, хто її першим опрацював. Кваліфікатор ставить себе в «Кваліфікатор»,
+    # а відповідальним після передачі стає менеджер; порожнє поле — опрацював сам відповідальний.
+    qualifier = str(cf.get('Кваліфікатор') or '').strip()
+
     return {
         'id':            item.get('id'),
-        'manager':       str(responsible.get('name') or '').strip(),
+        'manager':       qualifier or str(responsible.get('name') or '').strip(),
         'date':          date_val,
         'sale_date':     sale_date if is_realizatsiya else '',
         'creo':          str(cf.get('Крео')     or '').strip() or 'Не вказано',
@@ -136,13 +148,13 @@ def sync_crm(mode, send_event):
     else:
         CUT_DATE = '2026-01-01'
 
-    def process_item(item, status):
+    def process_item(item):
         funnel_id    = (item.get('funnel') or {}).get('id')
         funnel_title = (item.get('funnel') or {}).get('title', '')
         cf           = item.get('custom_fields') or {}
         ordered_at   = item.get('ordered_at') or item.get('created_at') or ''
         year         = int(ordered_at[:4]) if len(ordered_at) >= 4 else 0
-        result       = item.get('result')
+        status       = lead_status(item)
 
         is_b2c          = (funnel_id == 1 or 'B2C' in funnel_title or 'В2С' in funnel_title or 'Кінцевий' in funnel_title)
         is_realizatsiya = (funnel_id == 3 or 'Реаліз' in funnel_title)
@@ -156,7 +168,6 @@ def sync_crm(mode, send_event):
         is_fb = (source_id == FB_SOURCE_ID or source_name == 'FB Ads' or custom_src == 'FB Ads')
         if not is_fb: return []
 
-        if is_b2c and status == 'active' and result is not None: return []
         if is_realizatsiya and status == 'lost': return []
 
         out = []
@@ -172,12 +183,10 @@ def sync_crm(mode, send_event):
             if row.get('date'): out.append((row, status))
         return out
 
-    def fetch_segment(label, endpoint, phase_start, phase_len, status, max_pages=None):
+    def fetch_segment(label, endpoint, phase_start, phase_len):
         page = 1
         total_pages = 1
         while page <= total_pages:
-            if max_pages is not None and page > max_pages:
-                break
             try:
                 data = fetch_page(endpoint, page)
             except urllib.error.HTTPError as e:
@@ -188,18 +197,17 @@ def sync_crm(mode, send_event):
             items = data.get('items') or []
             pg    = data.get('pagination') or {}
             total_pages = int(pg.get('total_pages') or 1)
-            display_total = min(total_pages, max_pages) if max_pages else total_pages
 
             for item in items:
-                for row, kind in process_item(item, status):
+                for row, kind in process_item(item):
                     if kind == 'won':    won_rows.append(row)
                     elif kind == 'active': active_rows.append(row)
                     elif kind == 'lost':   lost_rows.append(row)
 
-            pct = phase_start + (page / display_total) * phase_len
+            pct = phase_start + (page / total_pages) * phase_len
             send_event({
                 'type': 'progress',
-                'label': f"{label}: {page}/{display_total}  ·  лідів:{len(active_rows)+len(lost_rows)}  програних:{len(lost_rows)}  оплат:{len(won_rows)}",
+                'label': f"{label}: {page}/{total_pages}  ·  лідів:{len(active_rows)+len(lost_rows)}  програних:{len(lost_rows)}  оплат:{len(won_rows)}",
                 'pct': round(min(pct, 99), 1),
             })
             page += 1
@@ -207,22 +215,20 @@ def sync_crm(mode, send_event):
         return True
 
     df = date_filter
+    # Один прохід без фільтра по result: статус угоди рахуємо з поля result у process_item.
+    # Окремі запити result_blank=1 / result_eq=failed губили archived і successful.
     if mode == 'inc':
         # updated_at_gteq — ловимо ВСІ зміни за останні INC_DAYS днів:
         # нові ліди, зміни статусів, оплати по лютневих заявках тощо.
-        seg1 = f"/agreements?q%5Bupdated_at_gteq%5D={CUT_DATE}&q%5Bresult_blank%5D=1{df}"
-        if not fetch_segment("Активні (оновлені)", seg1, 0, 50, 'active'): return
-        seg3 = f"/agreements?q%5Bresult_eq%5D=failed&q%5Bupdated_at_gteq%5D={CUT_DATE}{df}"
-        if not fetch_segment("Програні (оновлені)", seg3, 50, 49, 'lost', max_pages=20): return
+        seg = f"/agreements?q%5Bupdated_at_gteq%5D={CUT_DATE}{df}"
+        if not fetch_segment("Оновлені", seg, 0, 99): return
     elif mode == 'comments':
         # Тільки активні угоди (усі 2026) — оновлюємо коментарі, без програних/оплат
-        seg1 = f"/agreements?q%5Bcreated_at_gteq%5D=2026-01-01&q%5Bresult_blank%5D=1{df}"
-        if not fetch_segment("Коментарі", seg1, 0, 99, 'active'): return
+        seg = f"/agreements?q%5Bcreated_at_gteq%5D=2026-01-01&q%5Bresult_blank%5D=1{df}"
+        if not fetch_segment("Коментарі", seg, 0, 99): return
     else:
-        seg1 = f"/agreements?q%5Bcreated_at_gteq%5D=2026-01-01&q%5Bresult_blank%5D=1{df}"
-        if not fetch_segment("Активні 2026+", seg1, 0, 50, 'active'): return
-        seg3 = f"/agreements?q%5Bresult_eq%5D=failed&q%5Bcreated_at_gteq%5D=2026-01-01{df}"
-        if not fetch_segment("Програні 2026+", seg3, 50, 49, 'lost'): return
+        seg = f"/agreements?q%5Bcreated_at_gteq%5D=2026-01-01{df}"
+        if not fetch_segment("Угоди 2026+", seg, 0, 99): return
 
     # Incremental merge (in-memory on cloud)
     if mode == 'inc' and os.path.exists(DATA_FILE):
