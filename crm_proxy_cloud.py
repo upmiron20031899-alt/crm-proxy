@@ -96,6 +96,9 @@ def crm_item_to_row(item, status, is_realizatsiya=False):
         'stage':         str(stage.get('name')          or '').strip(),
         'last_note':     str(item.get('last_note')       or '').strip(),
         'reason':        str(archive_status.get('name') or '').strip(),
+        # Сире значення, без нормалізації: довідник областей живе в дашборді,
+        # щоб правити його без деплою проксі.
+        'region':        str(cf.get("Місцезнаходження об'єкту") or '').strip(),
         'form_purpose':  str(cf.get('Мета встановлення')   or '').strip(),
         'form_budget':   str(cf.get('Бюджет')               or '').strip(),
         'form_timeline': str(cf.get('Строки встановлення')  or '').strip(),
